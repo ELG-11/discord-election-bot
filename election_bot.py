@@ -255,7 +255,6 @@ async def debug(ctx):
     next_run = get_next_election_time(datetime.datetime.now(TIMEZONE))
     is_running = active_election_task is not None and not active_election_task.done()
 
-Use code with caution.
 channel_text = channel.mention if channel else "❌ Not found (check CHANNEL_ID)"
 cand_role_text = candidate_role.name if candidate_role else "❌ Not found"
 win_role_text = winner_role.name if winner_role else "❌ Not found"
