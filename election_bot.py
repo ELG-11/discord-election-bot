@@ -255,28 +255,32 @@ async def debug(ctx):
     next_run = get_next_election_time(datetime.datetime.now(TIMEZONE))
     is_running = active_election_task is not None and not active_election_task.done()
 
-channel_text = channel.mention if channel else "❌ Not found (check CHANNEL_ID)"
-cand_role_text = candidate_role.name if candidate_role else "❌ Not found"
-win_role_text = winner_role.name if winner_role else "❌ Not found"
-perm_text = "✅ Yes" if role_ok else "❌ NO — Drag the bot role ABOVE the winner role in Server Settings > Roles!"
-running_text = "Yes" if is_running else "No"
-next_run_text = next_run.strftime("%A, %b %d, %Y at %I:%M %p %Z")
-report = (
-f"🛠️ Election Bot Debug Report\n"
-f"• Server: {guild.name} ✅\n"
-f"• Channel: {channel_text}\n"
-f"• Candidate Role: {cand_role_text} ({len(candidates)} candidate(s): {candidate_names})\n"
-f"• Winner Role: {win_role_text}\n"
-f"• Bot Can Assign Winner Role: {perm_text}\n"
-f"• Election Currently Running: {running_text}\n"
-f"• Next Auto Election: {next_run_text}\n"
-f"• Admin Commands: !debug | !testpoll | !startelection | !stopelection"
-)
-await ctx.send(report)
+    channel_text = channel.mention if channel else "❌ Not found (check CHANNEL_ID)"
+    cand_role_text = candidate_role.name if candidate_role else "❌ Not found"
+    win_role_text = winner_role.name if winner_role else "❌ Not found"
+    perm_text = "✅ Yes" if role_ok else "❌ NO — Drag the bot role ABOVE the winner role in Server Settings > Roles!"
+    running_text = "Yes" if is_running else "No"
+    next_run_text = next_run.strftime("%A, %b %d, %Y at %I:%M %p %Z")
+
+    report = (
+        f"**🛠️ Election Bot Debug Report**\n"
+        f"• **Server:** {guild.name} ✅\n"
+        f"• **Channel:** {channel_text}\n"
+        f"• **Candidate Role:** {cand_role_text} ({len(candidates)} candidate(s): {candidate_names})\n"
+        f"• **Winner Role:** {win_role_text}\n"
+        f"• **Bot Can Assign Winner Role:** {perm_text}\n"
+        f"• **Election Currently Running:** {running_text}\n"
+        f"• **Next Auto Election:** {next_run_text}\n"
+        f"• **Admin Commands:** `!debug` | `!testpoll` | `!startelection` | `!stopelection`"
+    )
+    await ctx.send(report)
+
 @bot.event
 async def on_ready():
-print(f"Logged in as {bot.user}")
-if not scheduled_election.is_running():
-scheduled_election.start()
+    print(f"Logged in as {bot.user}")
+    if not scheduled_election.is_running():
+        scheduled_election.start()
+
 keep_alive()
 bot.run(TOKEN)
+
