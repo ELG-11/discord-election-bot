@@ -6,7 +6,7 @@ import logging
 import datetime
 from pathlib import Path
 from threading import Thread
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
@@ -14,7 +14,7 @@ from flask import Flask
 
 
 # ============================================================
-# LOGGING AND CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 logging.basicConfig(
@@ -30,10 +30,10 @@ CONFIG_FILE = Path("election_config.json")
 
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_INTERVAL_DAYS = 14
-DEFAULT_DURATION_MINUTES = 1440
+DEFAULT_DURATION_HOURS = 24
 
 MAX_CANDIDATES = 25
-MAX_EMPTY_RESTARTS = 2
+
 
 def env_int(name, default=0):
     try:
@@ -51,7 +51,8 @@ def load_config():
         "winner_role_id": env_int("WINNER_ROLE_ID"),
         "timezone": DEFAULT_TIMEZONE,
         "interval_days": DEFAULT_INTERVAL_DAYS,
-        "duration_minutes": DEFAULT_DURATION_MINUTES,
+        "duration_hours": DEFAULT_DURATION_HOURS,
+        "auto_start": True,
         "next_run": None,
     }
 
@@ -60,7 +61,7 @@ def load_config():
             saved = json.loads(CONFIG_FILE.read_text())
             defaults.update(saved)
         except Exception:
-            logger.exception("Could not read saved configuration.")
+            logger.exception("Could not load configuration.")
 
     return defaults
 
@@ -75,7 +76,7 @@ def save_config():
 def get_timezone():
     try:
         return ZoneInfo(config["timezone"])
-    except (ZoneInfoNotFoundError, KeyError):
+    except Exception:
         return ZoneInfo(DEFAULT_TIMEZONE)
 
 
@@ -88,25 +89,29 @@ def get_next_run():
         except ValueError:
             pass
 
-    now = datetime.datetime.now(get_timezone())
-    next_run = now + datetime.timedelta(days=config["interval_days"])
+    next_run = (
+        datetime.datetime.now(get_timezone())
+        + datetime.timedelta(days=config["interval_days"])
+    )
 
     config["next_run"] = next_run.isoformat()
     save_config()
-
     return next_run
 
 
 def schedule_next_run():
-    now = datetime.datetime.now(get_timezone())
-    next_run = now + datetime.timedelta(days=config["interval_days"])
+    next_run = (
+        datetime.datetime.now(get_timezone())
+        + datetime.timedelta(days=config["interval_days"])
+    )
+
     config["next_run"] = next_run.isoformat()
     save_config()
     return next_run
 
 
 # ============================================================
-# KEEP-ALIVE WEB SERVER
+# KEEP-ALIVE
 # ============================================================
 
 app = Flask("")
@@ -117,13 +122,12 @@ def home():
     return "Election bot is running."
 
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-
 def keep_alive():
-    Thread(target=run_web, daemon=True).start()
+    port = int(os.environ.get("PORT", 8080))
+    Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port),
+        daemon=True
+    ).start()
 
 
 # ============================================================
@@ -146,39 +150,39 @@ active_message = None
 
 
 # ============================================================
-# PERMISSIONS AND LOOKUPS
+# PERMISSIONS AND CONFIGURATION LOOKUPS
 # ============================================================
 
 def is_server_owner(ctx):
-    return ctx.guild is not None and ctx.author.id == ctx.guild.owner_id
+    return (
+        ctx.guild is not None
+        and ctx.author.id == ctx.guild.owner_id
+    )
+
+
+def is_server_owner_from_interaction(interaction):
+    return (
+        interaction.guild is not None
+        and interaction.user.id == interaction.guild.owner_id
+    )
 
 
 def get_configured_items(guild):
-    poll_channel = guild.get_channel(config["poll_channel_id"])
-    results_channel = guild.get_channel(config["results_channel_id"])
-    candidate_role = guild.get_role(config["candidate_role_id"])
-    winner_role = guild.get_role(config["winner_role_id"])
-
-    return poll_channel, results_channel, candidate_role, winner_role
-
-
-async def get_guild():
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        try:
-            guild = await bot.fetch_guild(GUILD_ID)
-        except discord.HTTPException:
-            return None
-    return guild
+    return (
+        guild.get_channel(config["poll_channel_id"]),
+        guild.get_channel(config["results_channel_id"]),
+        guild.get_role(config["candidate_role_id"]),
+        guild.get_role(config["winner_role_id"])
+    )
 
 
 # ============================================================
-# LIVE ELECTION VIEW
+# ELECTION POLL
 # ============================================================
 
 class ElectionView(discord.ui.View):
 
-    def __init__(self, candidates):
+    def __init__(self, candidates, duration_seconds):
         super().__init__(timeout=None)
 
         self.candidates = {
@@ -186,8 +190,12 @@ class ElectionView(discord.ui.View):
         }
 
         self.votes = {}
-        self.voter_names = {}
         self.closed = False
+
+        self.end_time = (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=duration_seconds)
+        )
 
         for candidate in candidates:
             button = discord.ui.Button(
@@ -195,10 +203,11 @@ class ElectionView(discord.ui.View):
                 style=discord.ButtonStyle.primary,
                 custom_id=f"election_vote_{candidate.id}"
             )
+
             button.callback = self.make_callback(candidate.id)
             self.add_item(button)
 
-    def make_embed(self, remaining=None):
+    def get_counts(self):
         counts = {
             candidate_id: 0
             for candidate_id in self.candidates
@@ -208,6 +217,20 @@ class ElectionView(discord.ui.View):
             if candidate_id in counts:
                 counts[candidate_id] += 1
 
+        return counts
+
+    def get_remaining(self):
+        remaining = (
+            self.end_time
+            - datetime.datetime.now(datetime.timezone.utc)
+        ).total_seconds()
+
+        return max(0, int(remaining))
+
+    def make_embed(self):
+
+        counts = self.get_counts()
+
         ranked = sorted(
             self.candidates.items(),
             key=lambda item: (
@@ -216,8 +239,11 @@ class ElectionView(discord.ui.View):
             )
         )
 
-        if self.votes:
-            highest = max(counts.values())
+        highest = max(counts.values(), default=0)
+
+        if highest == 0:
+            leader_text = "Waiting for the first vote."
+        else:
             leaders = [
                 member.display_name
                 for candidate_id, member in ranked
@@ -225,137 +251,91 @@ class ElectionView(discord.ui.View):
             ]
 
             if len(leaders) == 1:
-                leader_text = f"🏆 Currently leading: **{leaders[0]}**"
+                leader_text = f"🏆 **{leaders[0]}** is leading"
             else:
                 leader_text = (
-                    "⚖️ Currently tied: **"
-                    + ", ".join(leaders)
-                    + "**"
+                    "⚖️ **Tie:** " + ", ".join(leaders)
                 )
-        else:
-            leader_text = "Nobody has voted yet!"
 
         standings = []
 
+        total_votes = len(self.votes)
+
         for candidate_id, member in ranked:
             amount = counts[candidate_id]
+
+            if amount == highest and amount > 0:
+                marker = "🟢"
+            else:
+                marker = "▫️"
+
             name = discord.utils.escape_markdown(
                 member.display_name
             )
 
-            marker = "🟢" if amount == max(
-                counts.values(), default=0
-            ) and amount > 0 else "▫️"
+            percentage = (
+                round(amount / total_votes * 100)
+                if total_votes else 0
+            )
 
             standings.append(
-                f"{marker} **{name}** — **{amount}** vote(s)"
+                f"{marker} **{name}** — {amount} "
+                f"({percentage}%)"
             )
 
-        standings_text = "\n".join(standings)
+        if self.closed:
+            status = "🔒 VOTING CLOSED"
+            color = discord.Color.dark_grey()
+            timer_text = "Voting has ended."
+        else:
+            status = "🟢 VOTING OPEN"
+            color = discord.Color.gold()
 
-        voter_lines = []
-
-        for user_id, candidate_id in self.votes.items():
-            candidate = self.candidates.get(candidate_id)
-
-            if candidate is None:
-                continue
-
-            voter = self.voter_names.get(
-                user_id, f"User {user_id}"
-            )
-
-            voter_lines.append(
-                f"• **{discord.utils.escape_markdown(voter)}** "
-                f"→ **{discord.utils.escape_markdown(candidate.display_name)}**"
-            )
-
-        voter_text = (
-            "\n".join(voter_lines)
-            if voter_lines else "Nobody has voted yet."
-        )
-
-        if len(standings_text) > 1024:
-            standings_text = standings_text[:1000] + "\n... shortened"
-
-        if len(voter_text) > 1024:
-            visible = []
-            used = 0
-
-            for line in voter_lines:
-                if used + len(line) + 1 > 980:
-                    break
-                visible.append(line)
-                used += len(line) + 1
-
-            remaining_voters = len(voter_lines) - len(visible)
-            voter_text = "\n".join(visible)
-
-            if remaining_voters:
-                voter_text += (
-                    f"\n...and {remaining_voters} more vote(s)"
-                )
-
-        status = (
-            "🟢 VOTING OPEN"
-            if not self.closed
-            else "🔒 VOTING CLOSED"
-        )
-
-        description = (
-            f"{status}\n"
-            f"{leader_text}\n"
-        )
-
-        if remaining is not None and not self.closed:
-            seconds = max(0, int(remaining))
+            seconds = self.get_remaining()
             hours, remainder = divmod(seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
 
-            description += (
-                f"\n⏳ **Time remaining:** "
-                f"{hours:02d}:{minutes:02d}:{seconds:02d}\n"
-            )
-
-        description += (
-            "\nChoose a candidate below to vote. "
-            "You may change your vote before voting closes."
-        )
+            if hours:
+                timer_text = (
+                    f"⏳ **Time left:** "
+                    f"{hours}h {minutes}m"
+                )
+            elif minutes:
+                timer_text = (
+                    f"⏳ **Time left:** "
+                    f"{minutes}m {seconds}s"
+                )
+            else:
+                timer_text = f"⏳ **Time left:** {seconds}s"
 
         embed = discord.Embed(
-            title="🗳️ Server Leader Election",
-            description=description,
-            color=(
-                discord.Color.gold()
-                if not self.closed
-                else discord.Color.dark_grey()
-            )
+            title="🗳️ Server Election",
+            description=(
+                f"{status}\n\n"
+                f"**Who's winning?**\n"
+                f"{leader_text}\n\n"
+                f"{timer_text}\n\n"
+                "**Choose a candidate below to vote.**\n"
+                "You can change your vote before voting closes."
+            ),
+            color=color
         )
 
         embed.add_field(
-            name="📊 Current standings",
-            value=standings_text or "No candidates.",
-            inline=False
-        )
-
-        embed.add_field(
-            name="👥 Who voted for whom",
-            value=voter_text,
+            name="📊 Current votes",
+            value="\n".join(standings) or "No candidates.",
             inline=False
         )
 
         embed.set_footer(
-            text=(
-                f"{len(self.votes)} vote(s) • "
-                "Vote details are visible to everyone who can view this poll"
-            )
+            text=f"{total_votes} total vote(s)"
         )
 
         return embed
 
     def make_callback(self, candidate_id):
 
-        async def callback(interaction: discord.Interaction):
+        async def callback(interaction):
 
             if self.closed:
                 await interaction.response.send_message(
@@ -372,11 +352,8 @@ class ElectionView(discord.ui.View):
                 return
 
             self.votes[interaction.user.id] = candidate_id
-            self.voter_names[interaction.user.id] = (
-                interaction.user.display_name
-            )
 
-            # Update the existing poll message, not a new message.
+            # Updates the existing poll message.
             await interaction.response.edit_message(
                 embed=self.make_embed(),
                 view=self
@@ -390,17 +367,14 @@ class ElectionView(discord.ui.View):
 # ============================================================
 
 async def announce_results(guild, results_channel, winner_role, view):
+
     if not view.votes:
         await results_channel.send(
             "No votes were cast. No winner was selected."
         )
         return
 
-    counts = {}
-
-    for candidate_id in view.votes.values():
-        counts[candidate_id] = counts.get(candidate_id, 0) + 1
-
+    counts = view.get_counts()
     highest = max(counts.values())
 
     top_candidates = [
@@ -431,12 +405,12 @@ async def announce_results(guild, results_channel, winner_role, view):
 
     role_errors = []
 
-    # Refresh member cache before checking old role holders.
     try:
         await guild.chunk(cache=True)
     except discord.HTTPException:
-        logger.warning("Could not refresh all server members.")
+        logger.warning("Could not refresh the member list.")
 
+    # Remove the Winner role from previous holders.
     for member in guild.members:
         if winner_role in member.roles and member.id != winner.id:
             try:
@@ -455,6 +429,7 @@ async def announce_results(guild, results_channel, winner_role, view):
                 )
                 break
 
+    # Give the Winner role to the new winner.
     try:
         if winner_role not in winner.roles:
             await winner.add_roles(
@@ -462,9 +437,9 @@ async def announce_results(guild, results_channel, winner_role, view):
                 reason="Won the server election"
             )
     except discord.Forbidden:
-        role_errors.append("Could not assign the winner role.")
+        role_errors.append("Could not assign the Winner role.")
     except discord.HTTPException:
-        role_errors.append("Discord error assigning the winner role.")
+        role_errors.append("Discord error assigning the Winner role.")
 
     embed = discord.Embed(
         title="🏆 Election Results",
@@ -475,14 +450,12 @@ async def announce_results(guild, results_channel, winner_role, view):
         color=discord.Color.gold()
     )
 
-    sorted_counts = sorted(
-        counts.items(),
-        key=lambda item: -item[1]
-    )
-
     lines = []
 
-    for candidate_id, amount in sorted_counts:
+    for candidate_id, amount in sorted(
+        counts.items(),
+        key=lambda item: -item[1]
+    ):
         member = guild.get_member(candidate_id)
         name = member.display_name if member else str(candidate_id)
         lines.append(f"• **{name}** — {amount} vote(s)")
@@ -498,8 +471,8 @@ async def announce_results(guild, results_channel, winner_role, view):
             name="⚠️ Role assignment warning",
             value=(
                 "\n".join(role_errors)
-                + "\n\nMake sure the bot has Manage Roles and "
-                "its role is above the Winner role."
+                + "\n\nCheck that the bot has Manage Roles "
+                "and its role is above the Winner role."
             ),
             inline=False
         )
@@ -555,39 +528,37 @@ async def run_election(guild, duration_seconds):
         if len(candidates) > MAX_CANDIDATES:
             await poll_channel.send(
                 f"⚠️ There are {len(candidates)} candidates. "
-                f"Discord supports at most {MAX_CANDIDATES} voting buttons."
+                f"The current button layout supports up to "
+                f"{MAX_CANDIDATES} candidates."
             )
             return
 
-        view = ElectionView(candidates)
+        view = ElectionView(candidates, duration_seconds)
         active_view = view
 
-        remaining = duration_seconds
-
-        embed = view.make_embed(remaining)
-
-        msg = await poll_channel.send(
-            embed=embed,
+        message = await poll_channel.send(
+            embed=view.make_embed(),
             view=view
         )
 
-        active_message = msg
+        active_message = message
 
         logger.info("Election started in %s.", guild.name)
 
-        # Refresh countdown and scoreboard every 60 seconds.
-        while remaining > 0:
-            await asyncio.sleep(min(60, remaining))
-            remaining = max(0, remaining - 60)
+        # Update the countdown and poll every 30 seconds.
+        while view.get_remaining() > 0:
+            await asyncio.sleep(
+                min(30, view.get_remaining())
+            )
 
-            if remaining > 0:
+            if view.get_remaining() > 0:
                 try:
-                    await msg.edit(
-                        embed=view.make_embed(remaining),
+                    await message.edit(
+                        embed=view.make_embed(),
                         view=view
                     )
                 except discord.HTTPException:
-                    logger.exception("Could not update poll message.")
+                    logger.exception("Could not update poll.")
 
         view.closed = True
 
@@ -595,12 +566,12 @@ async def run_election(guild, duration_seconds):
             item.disabled = True
 
         try:
-            await msg.edit(
+            await message.edit(
                 embed=view.make_embed(),
                 view=view
             )
         except discord.HTTPException:
-            logger.exception("Could not close poll message.")
+            logger.exception("Could not close poll.")
 
         view.stop()
 
@@ -631,11 +602,12 @@ async def run_election(guild, duration_seconds):
             except discord.HTTPException:
                 pass
 
-        if poll_channel:
+        try:
             await poll_channel.send(
-                "🛑 Election stopped by an administrator. "
-                "No winner was selected."
+                "🛑 Election stopped. No winner was selected."
             )
+        except Exception:
+            pass
 
         raise
 
@@ -655,7 +627,7 @@ async def run_election(guild, duration_seconds):
 
 
 # ============================================================
-# LAUNCH ELECTION
+# START AND STOP ELECTIONS
 # ============================================================
 
 def launch_election(guild, duration_seconds):
@@ -673,114 +645,103 @@ def launch_election(guild, duration_seconds):
 
 
 # ============================================================
-# DASHBOARD: SCHEDULE SETTINGS
+# SIMPLE SCHEDULE SETTINGS
 # ============================================================
 
-class ScheduleModal(discord.ui.Modal, title="Election Schedule Settings"):
+class ScheduleModal(discord.ui.Modal, title="Election Settings"):
 
     interval = discord.ui.TextInput(
         label="Repeat every how many days?",
         placeholder="14",
         default=str(config["interval_days"]),
-        max_length=5
-    )
-
-    date = discord.ui.TextInput(
-        label="Next election date (YYYY-MM-DD)",
-        placeholder="2026-12-14",
-        required=True,
-        max_length=10
-    )
-
-    time = discord.ui.TextInput(
-        label="Start time (24-hour HH:MM)",
-        placeholder="23:00",
-        required=True,
-        max_length=5
-    )
-
-    timezone = discord.ui.TextInput(
-        label="Timezone",
-        placeholder="America/New_York",
-        default=config["timezone"],
-        max_length=60
+        max_length=4
     )
 
     duration = discord.ui.TextInput(
-        label="Voting duration in minutes",
-        placeholder="1440",
-        default=str(config["duration_minutes"]),
-        max_length=7
+        label="Voting duration in hours?",
+        placeholder="24",
+        default=str(config["duration_hours"]),
+        max_length=4
     )
 
     async def on_submit(self, interaction):
 
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change settings.",
+                ephemeral=True
+            )
+            return
+
         try:
             interval_days = int(self.interval.value)
-            duration_minutes = int(self.duration.value)
+            duration_hours = int(self.duration.value)
 
-            if interval_days < 1 or interval_days > 3650:
-                raise ValueError("Repeat interval must be between 1 and 3650 days.")
+            if not 1 <= interval_days <= 3650:
+                raise ValueError(
+                    "Repeat interval must be between 1 and 3650 days."
+                )
 
-            if duration_minutes < 1:
-                raise ValueError("Duration must be at least one minute.")
-
-            timezone = ZoneInfo(self.timezone.value.strip())
-
-            date_value = datetime.date.fromisoformat(self.date.value.strip())
-            time_value = datetime.time.fromisoformat(self.time.value.strip())
-
-            next_run = datetime.datetime.combine(
-                date_value,
-                time_value,
-                tzinfo=timezone
-            )
-
-            if next_run <= datetime.datetime.now(timezone):
-                raise ValueError("The next election date and time must be in the future.")
+            if not 1 <= duration_hours <= 8760:
+                raise ValueError(
+                    "Voting duration must be between 1 and 8760 hours."
+                )
 
             config["interval_days"] = interval_days
-            config["duration_minutes"] = duration_minutes
-            config["timezone"] = self.timezone.value.strip()
-            config["next_run"] = next_run.isoformat()
+            config["duration_hours"] = duration_hours
 
+            # Start the new schedule from the time settings are saved.
+            next_run = (
+                datetime.datetime.now(get_timezone())
+                + datetime.timedelta(days=interval_days)
+            )
+
+            config["next_run"] = next_run.isoformat()
             save_config()
 
             await interaction.response.send_message(
-                "✅ Election schedule saved!\n"
+                "✅ Settings saved!\n"
                 f"Repeats every **{interval_days} days**.\n"
-                f"Next election: **{next_run.strftime('%B %d, %Y at %I:%M %p %Z')}**.\n"
-                f"Voting duration: **{duration_minutes} minutes**.",
+                f"Voting lasts **{duration_hours} hours**.\n"
+                f"Next election: **{next_run.strftime('%b %d at %I:%M %p')}**.",
                 ephemeral=True
             )
 
-        except (ValueError, ZoneInfoNotFoundError) as error:
+        except ValueError as error:
             await interaction.response.send_message(
-                f"⚠️ Invalid setting: {error}",
+                f"⚠️ {error}",
                 ephemeral=True
             )
 
 
 # ============================================================
-# DASHBOARD: CHANNEL SELECTORS
+# CHANNEL SELECTORS
 # ============================================================
 
 class PollChannelSelect(discord.ui.ChannelSelect):
 
     def __init__(self):
         super().__init__(
-            placeholder="Choose the poll channel",
+            placeholder="Poll channel",
             channel_types=[discord.ChannelType.text],
             min_values=1,
             max_values=1
         )
 
     async def callback(self, interaction):
+
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change settings.",
+                ephemeral=True
+            )
+            return
+
         config["poll_channel_id"] = self.values[0].id
         save_config()
 
         await interaction.response.send_message(
-            f"✅ Poll channel set to {self.values[0].mention}.",
+            f"✅ Poll channel: {self.values[0].mention}",
             ephemeral=True
         )
 
@@ -789,41 +750,66 @@ class ResultsChannelSelect(discord.ui.ChannelSelect):
 
     def __init__(self):
         super().__init__(
-            placeholder="Choose the results channel",
+            placeholder="Results channel",
             channel_types=[discord.ChannelType.text],
             min_values=1,
             max_values=1
         )
 
     async def callback(self, interaction):
+
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change settings.",
+                ephemeral=True
+            )
+            return
+
         config["results_channel_id"] = self.values[0].id
         save_config()
 
         await interaction.response.send_message(
-            f"✅ Results channel set to {self.values[0].mention}.",
+            f"✅ Results channel: {self.values[0].mention}",
             ephemeral=True
         )
 
 
 # ============================================================
-# DASHBOARD: ROLE SELECTORS
+# ROLE SELECTORS
 # ============================================================
 
 class CandidateRoleSelect(discord.ui.RoleSelect):
 
     def __init__(self):
         super().__init__(
-            placeholder="Choose the Candidate role",
+            placeholder="Candidate role",
             min_values=1,
             max_values=1
         )
 
     async def callback(self, interaction):
-        config["candidate_role_id"] = self.values[0].id
+
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change settings.",
+                ephemeral=True
+            )
+            return
+
+        role = self.values[0]
+
+        if role.is_default() or role.managed:
+            await interaction.response.send_message(
+                "That role cannot be used as the Candidate role.",
+                ephemeral=True
+            )
+            return
+
+        config["candidate_role_id"] = role.id
         save_config()
 
         await interaction.response.send_message(
-            f"✅ Candidate role set to **{self.values[0].name}**.",
+            f"✅ Candidate role: **{role.name}**",
             ephemeral=True
         )
 
@@ -832,23 +818,40 @@ class WinnerRoleSelect(discord.ui.RoleSelect):
 
     def __init__(self):
         super().__init__(
-            placeholder="Choose the Winner role",
+            placeholder="Winner role",
             min_values=1,
             max_values=1
         )
 
     async def callback(self, interaction):
-        config["winner_role_id"] = self.values[0].id
+
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can change settings.",
+                ephemeral=True
+            )
+            return
+
+        role = self.values[0]
+
+        if role.is_default() or role.managed:
+            await interaction.response.send_message(
+                "That role cannot be used as the Winner role.",
+                ephemeral=True
+            )
+            return
+
+        config["winner_role_id"] = role.id
         save_config()
 
         await interaction.response.send_message(
-            f"✅ Winner role set to **{self.values[0].name}**.",
+            f"✅ Winner role: **{role.name}**",
             ephemeral=True
         )
 
 
 # ============================================================
-# DASHBOARD
+# ADMIN DASHBOARD
 # ============================================================
 
 class ElectionDashboard(discord.ui.View):
@@ -862,21 +865,13 @@ class ElectionDashboard(discord.ui.View):
         self.add_item(WinnerRoleSelect())
 
     @discord.ui.button(
-        label="Schedule & Timer",
+        label="Schedule",
         style=discord.ButtonStyle.primary,
         emoji="⏰",
         row=4
     )
     async def schedule_button(self, interaction, button):
-        await interaction.response.send_modal(ScheduleModal())
 
-    @discord.ui.button(
-        label="Start Test Poll",
-        style=discord.ButtonStyle.success,
-        emoji="🧪",
-        row=4
-    )
-    async def test_button(self, interaction, button):
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -884,26 +879,41 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        guild = interaction.guild
-
-        if launch_election(guild, 30):
-            await interaction.response.send_message(
-                "🧪 A 30-second test poll has started.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "An election is already running.",
-                ephemeral=True
-            )
+        await interaction.response.send_modal(ScheduleModal())
 
     @discord.ui.button(
-        label="Start Election Now",
-        style=discord.ButtonStyle.primary,
+        label="Auto-start",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔁",
+        row=4
+    )
+    async def auto_button(self, interaction, button):
+
+        if not is_server_owner_from_interaction(interaction):
+            await interaction.response.send_message(
+                "Only the server owner can use this dashboard.",
+                ephemeral=True
+            )
+            return
+
+        config["auto_start"] = not config["auto_start"]
+        save_config()
+
+        status = "ON" if config["auto_start"] else "OFF"
+
+        await interaction.response.send_message(
+            f"🔁 Automatic elections are now **{status}**.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Start Election",
+        style=discord.ButtonStyle.success,
         emoji="▶️",
         row=4
     )
     async def start_button(self, interaction, button):
+
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -911,11 +921,11 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        duration = config["duration_minutes"] * 60
+        duration = config["duration_hours"] * 3600
 
         if launch_election(interaction.guild, duration):
             await interaction.response.send_message(
-                "▶️ Election started using your configured voting duration.",
+                "▶️ Election started.",
                 ephemeral=True
             )
         else:
@@ -931,6 +941,7 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def stop_button(self, interaction, button):
+
         global active_election_task
 
         if not is_server_owner_from_interaction(interaction):
@@ -949,16 +960,9 @@ class ElectionDashboard(discord.ui.View):
             )
         else:
             await interaction.response.send_message(
-                "No election is currently running.",
+                "No election is running.",
                 ephemeral=True
             )
-
-
-def is_server_owner_from_interaction(interaction):
-    return (
-        interaction.guild is not None
-        and interaction.user.id == interaction.guild.owner_id
-    )
 
 
 # ============================================================
@@ -975,24 +979,35 @@ async def help_command(ctx):
         return
 
     next_run = get_next_run()
-    poll_channel, results_channel, candidate_role, winner_role = (
-        get_configured_items(ctx.guild)
+
+    poll, results, candidate, winner = get_configured_items(ctx.guild)
+
+    auto_status = (
+        "🟢 ON" if config["auto_start"] else "🔴 OFF"
     )
 
+    if active_election_task and not active_election_task.done():
+        election_status = "🟢 Election running"
+    else:
+        election_status = "⚪ No election running"
+
     embed = discord.Embed(
-        title="🛠️ Election Control Panel",
+        title="Election Dashboard",
         description=(
-            "Manage your election using the menus and buttons below.\n\n"
-            "**Schedule:**\n"
-            f"Repeats every **{config['interval_days']} days**\n"
-            f"Next election: **{next_run.strftime('%b %d, %Y %I:%M %p %Z')}**\n"
-            f"Voting duration: **{config['duration_minutes']} minutes**\n\n"
-            "**Channels:**\n"
-            f"Poll: {poll_channel.mention if poll_channel else 'Not configured'}\n"
-            f"Results: {results_channel.mention if results_channel else 'Not configured'}\n\n"
-            "**Roles:**\n"
-            f"Candidate: {candidate_role.name if candidate_role else 'Not configured'}\n"
-            f"Winner: {winner_role.name if winner_role else 'Not configured'}"
+            f"{election_status}\n\n"
+            f"**Automatic elections:** {auto_status}\n"
+            f"**Repeats:** Every {config['interval_days']} days\n"
+            f"**Voting duration:** {config['duration_hours']} hours\n"
+            f"**Next election:** "
+            f"{next_run.strftime('%b %d, %Y at %I:%M %p')}\n\n"
+            f"**Poll channel:** "
+            f"{poll.mention if poll else 'Not set'}\n"
+            f"**Results channel:** "
+            f"{results.mention if results else 'Not set'}\n\n"
+            f"**Candidate role:** "
+            f"{candidate.name if candidate else 'Not set'}\n"
+            f"**Winner role:** "
+            f"{winner.name if winner else 'Not set'}"
         ),
         color=discord.Color.blurple()
     )
@@ -1004,11 +1019,12 @@ async def help_command(ctx):
 
 
 # ============================================================
-# OPTIONAL COMMANDS
+# COMMANDS
 # ============================================================
 
 @bot.command()
 async def testpoll(ctx):
+
     if not is_server_owner(ctx):
         return
 
@@ -1020,12 +1036,13 @@ async def testpoll(ctx):
 
 @bot.command()
 async def startelection(ctx):
+
     if not is_server_owner(ctx):
         return
 
     if launch_election(
         ctx.guild,
-        config["duration_minutes"] * 60
+        config["duration_hours"] * 3600
     ):
         await ctx.send("▶️ Election started.")
     else:
@@ -1034,6 +1051,7 @@ async def startelection(ctx):
 
 @bot.command()
 async def stopelection(ctx):
+
     global active_election_task
 
     if not is_server_owner(ctx):
@@ -1043,18 +1061,18 @@ async def stopelection(ctx):
         active_election_task.cancel()
         await ctx.send("🛑 Election stop requested.")
     else:
-        await ctx.send("No election is currently running.")
+        await ctx.send("No election is running.")
 
 
 @bot.command()
 async def debug(ctx):
+
     if not is_server_owner(ctx):
         return
 
-    guild = ctx.guild
-    poll, results, candidate, winner = get_configured_items(guild)
+    poll, results, candidate, winner = get_configured_items(ctx.guild)
 
-    bot_member = guild.get_member(bot.user.id)
+    bot_member = ctx.guild.get_member(bot.user.id)
 
     hierarchy_ok = bool(
         bot_member
@@ -1070,7 +1088,7 @@ async def debug(ctx):
     next_run = get_next_run()
 
     embed = discord.Embed(
-        title="🛠️ Election Bot Debug",
+        title="Election Bot Debug",
         color=discord.Color.blue()
     )
 
@@ -1099,13 +1117,19 @@ async def debug(ctx):
     )
 
     embed.add_field(
-        name="Bot can assign roles",
+        name="Role permissions",
         value=(
-            "✅ Yes"
+            "✅ Bot can manage Winner role"
             if manage_roles and hierarchy_ok
             else "❌ Check Manage Roles and role hierarchy"
         ),
         inline=False
+    )
+
+    embed.add_field(
+        name="Automatic elections",
+        value="ON" if config["auto_start"] else "OFF",
+        inline=True
     )
 
     embed.add_field(
@@ -1118,32 +1142,35 @@ async def debug(ctx):
 
 
 # ============================================================
-# AUTOMATIC REPEATING SCHEDULER
+# AUTOMATIC SCHEDULER
 # ============================================================
 
 @tasks.loop(seconds=30)
 async def scheduled_election():
 
     try:
+        if not config["auto_start"]:
+            return
+
         next_run = get_next_run()
         now = datetime.datetime.now(next_run.tzinfo)
 
         if now >= next_run:
+
+            # Move the next date forward so it cannot trigger repeatedly.
+            schedule_next_run()
+
             guild = bot.get_guild(GUILD_ID)
 
             if guild is None:
                 logger.error("Scheduled election: server not found.")
                 return
 
-            # Advance the schedule before starting the poll.
-            # This prevents the scheduler from launching it repeatedly.
-            schedule_next_run()
-
-            duration = config["duration_minutes"] * 60
+            duration = config["duration_hours"] * 3600
 
             if not launch_election(guild, duration):
                 logger.warning(
-                    "Scheduled election was due, but another election is active."
+                    "An election was already running when the schedule triggered."
                 )
 
     except Exception:
