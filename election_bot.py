@@ -25,90 +25,133 @@ logging.basicConfig(
 logger = logging.getLogger("election_bot")
 
 TOKEN = os.environ["TOKEN"]
-GUILD_ID = int(os.environ["GUILD_ID"])
-
 CONFIG_FILE = Path("election_config.json")
 
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_INTERVAL_DAYS = 14
 DEFAULT_DURATION_HOURS = 24
 DEFAULT_TIE_DURATION_HOURS = 1
-
 MAX_CANDIDATES = 25
 
+DEFAULT_CONFIG = {
+    "poll_channel_id": 0,
+    "results_channel_id": 0,
+    "candidate_role_id": 0,
+    "winner_role_id": 0,
+    "timezone": DEFAULT_TIMEZONE,
+    "interval_seconds": DEFAULT_INTERVAL_DAYS * 86400,
+    "duration_seconds": DEFAULT_DURATION_HOURS * 3600,
+    "tie_duration_seconds": DEFAULT_TIE_DURATION_HOURS * 3600,
+    "interval_days": DEFAULT_INTERVAL_DAYS,
+    "duration_hours": DEFAULT_DURATION_HOURS,
+    "tie_duration_hours": DEFAULT_TIE_DURATION_HOURS,
+    "auto_start": True,
+    "next_run": None,
+}
 
-def env_int(name, default=0):
+
+# ============================================================
+# MULTI-SERVER CONFIGURATION STORAGE
+# ============================================================
+
+all_configs = {"guilds": {}}
+
+
+def load_all_configs():
+    global all_configs
+
+    if not CONFIG_FILE.exists():
+        return
+
     try:
-        return int(os.environ.get(name, default))
-    except (ValueError, TypeError):
-        return default
+        saved = json.loads(CONFIG_FILE.read_text())
+
+        # New multi-server format.
+        if isinstance(saved.get("guilds"), dict):
+            all_configs = saved
+            return
+
+        # Migrate the old single-server configuration.
+        old_guild_id = saved.get("guild_id")
+
+        if old_guild_id:
+            guild_id = str(old_guild_id)
+
+            migrated = DEFAULT_CONFIG.copy()
+            migrated.update(saved)
+
+            all_configs = {
+                "guilds": {
+                    guild_id: migrated
+                }
+            }
+
+            logger.info(
+                "Migrated previous configuration for server %s.",
+                guild_id
+            )
+        else:
+            logger.warning(
+                "Old configuration had no server ID. "
+                "Starting with fresh server configurations."
+            )
+
+    except Exception:
+        logger.exception("Could not load configuration.")
 
 
-def load_config():
-    defaults = {
-        "guild_id": GUILD_ID,
-        "poll_channel_id": env_int("CHANNEL_ID"),
-        "results_channel_id": env_int("CHANNEL_ID"),
-        "candidate_role_id": env_int("CANDIDATE_ROLE_ID"),
-        "winner_role_id": env_int("WINNER_ROLE_ID"),
-        "timezone": DEFAULT_TIMEZONE,
-
-        "interval_days": DEFAULT_INTERVAL_DAYS,
-        "duration_hours": DEFAULT_DURATION_HOURS,
-        "tie_duration_hours": DEFAULT_TIE_DURATION_HOURS,
-
-        "interval_seconds": DEFAULT_INTERVAL_DAYS * 86400,
-        "duration_seconds": DEFAULT_DURATION_HOURS * 3600,
-        "tie_duration_seconds": DEFAULT_TIE_DURATION_HOURS * 3600,
-
-        "auto_start": True,
-        "next_run": None,
-    }
-
-    if CONFIG_FILE.exists():
-        try:
-            saved = json.loads(CONFIG_FILE.read_text())
-            defaults.update(saved)
-
-            if "interval_seconds" not in saved:
-                defaults["interval_seconds"] = (
-                    defaults["interval_days"] * 86400
-                )
-
-            if "duration_seconds" not in saved:
-                defaults["duration_seconds"] = (
-                    defaults["duration_hours"] * 3600
-                )
-
-            if "tie_duration_seconds" not in saved:
-                defaults["tie_duration_seconds"] = (
-                    defaults["tie_duration_hours"] * 3600
-                )
-
-        except Exception:
-            logger.exception("Could not load configuration.")
-
-    return defaults
+def save_all_configs():
+    CONFIG_FILE.write_text(
+        json.dumps(all_configs, indent=4)
+    )
 
 
-config = load_config()
+def get_config(guild):
+    guild_id = str(guild.id)
+
+    if guild_id not in all_configs["guilds"]:
+        new_config = DEFAULT_CONFIG.copy()
+
+        new_config["next_run"] = (
+            datetime.datetime.now(
+                ZoneInfo(DEFAULT_TIMEZONE)
+            )
+            + datetime.timedelta(
+                seconds=new_config["interval_seconds"]
+            )
+        ).isoformat()
+
+        all_configs["guilds"][guild_id] = new_config
+        save_all_configs()
+
+        logger.info(
+            "Created election configuration for %s (%s).",
+            guild.name,
+            guild.id
+        )
+
+    cfg = all_configs["guilds"][guild_id]
+
+    # Ensure older configurations have all required settings.
+    for key, value in DEFAULT_CONFIG.items():
+        if key not in cfg:
+            cfg[key] = value
+
+    return cfg
 
 
 def save_config():
-    CONFIG_FILE.write_text(json.dumps(config, indent=4))
+    save_all_configs()
 
+
+load_all_configs()
+
+
+# ============================================================
+# TIME SETTINGS
+# ============================================================
 
 def parse_time(value, default_unit, maximum_seconds):
-    """
-    Supported formats:
-    30s = 30 seconds
-    5m  = 5 minutes
-    2h  = 2 hours
-    14d = 14 days
-
-    Plain numbers use the default unit.
-    """
-
     value = value.strip().lower().replace(" ", "")
 
     match = re.fullmatch(r"(\d+)(s|m|h|d)?", value)
@@ -164,15 +207,15 @@ def format_time(seconds):
     return " ".join(parts) if parts else "0s"
 
 
-def get_timezone():
+def get_timezone(cfg):
     try:
-        return ZoneInfo(config["timezone"])
+        return ZoneInfo(cfg["timezone"])
     except Exception:
         return ZoneInfo(DEFAULT_TIMEZONE)
 
 
-def get_next_run():
-    value = config.get("next_run")
+def get_next_run(cfg):
+    value = cfg.get("next_run")
 
     if value:
         try:
@@ -181,23 +224,27 @@ def get_next_run():
             pass
 
     next_run = (
-        datetime.datetime.now(get_timezone())
-        + datetime.timedelta(seconds=config["interval_seconds"])
+        datetime.datetime.now(get_timezone(cfg))
+        + datetime.timedelta(
+            seconds=cfg["interval_seconds"]
+        )
     )
 
-    config["next_run"] = next_run.isoformat()
+    cfg["next_run"] = next_run.isoformat()
     save_config()
 
     return next_run
 
 
-def schedule_next_run():
+def schedule_next_run(cfg):
     next_run = (
-        datetime.datetime.now(get_timezone())
-        + datetime.timedelta(seconds=config["interval_seconds"])
+        datetime.datetime.now(get_timezone(cfg))
+        + datetime.timedelta(
+            seconds=cfg["interval_seconds"]
+        )
     )
 
-    config["next_run"] = next_run.isoformat()
+    cfg["next_run"] = next_run.isoformat()
     save_config()
 
     return next_run
@@ -219,7 +266,10 @@ def keep_alive():
     port = int(os.environ.get("PORT", 8080))
 
     Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port),
+        target=lambda: app.run(
+            host="0.0.0.0",
+            port=port
+        ),
         daemon=True
     ).start()
 
@@ -238,9 +288,12 @@ bot = commands.Bot(
     help_command=None
 )
 
-active_election_task = None
-active_view = None
-active_message = None
+# Each server gets its own election task.
+active_election_tasks = {}
+
+# Each server gets its own active poll information.
+active_views = {}
+active_messages = {}
 
 
 # ============================================================
@@ -261,12 +314,12 @@ def is_server_owner_from_interaction(interaction):
     )
 
 
-def get_configured_items(guild):
+def get_configured_items(guild, cfg):
     return (
-        guild.get_channel(config["poll_channel_id"]),
-        guild.get_channel(config["results_channel_id"]),
-        guild.get_role(config["candidate_role_id"]),
-        guild.get_role(config["winner_role_id"])
+        guild.get_channel(cfg["poll_channel_id"]),
+        guild.get_channel(cfg["results_channel_id"]),
+        guild.get_role(cfg["candidate_role_id"]),
+        guild.get_role(cfg["winner_role_id"])
     )
 
 
@@ -276,7 +329,12 @@ def get_configured_items(guild):
 
 class ElectionView(discord.ui.View):
 
-    def __init__(self, candidates, duration_seconds, round_name="Election"):
+    def __init__(
+        self,
+        candidates,
+        duration_seconds,
+        round_name="Election"
+    ):
         super().__init__(timeout=None)
 
         self.candidates = {
@@ -465,7 +523,6 @@ class ManualWinnerView(discord.ui.View):
     def __init__(self, guild, tied_candidates):
         super().__init__(timeout=86400)
 
-        self.guild = guild
         self.owner_id = guild.owner_id
         self.future = asyncio.get_running_loop().create_future()
 
@@ -526,8 +583,11 @@ class ManualWinnerView(discord.ui.View):
             item.disabled = True
 
 
-async def ask_owner_to_choose(guild, results_channel, tied_candidates):
-
+async def ask_owner_to_choose(
+    guild,
+    results_channel,
+    tied_candidates
+):
     view = ManualWinnerView(guild, tied_candidates)
 
     mentions = ", ".join(
@@ -583,7 +643,6 @@ async def announce_results(
     winner_id=None,
     manual_selection=False
 ):
-
     if not view.votes:
         await results_channel.send(
             "No votes were cast. No winner was selected."
@@ -718,16 +777,13 @@ async def run_poll(
     duration_seconds,
     round_name
 ):
-
-    global active_view, active_message
-
     view = ElectionView(
         candidates,
         duration_seconds,
         round_name=round_name
     )
 
-    active_view = view
+    active_views[guild.id] = view
 
     closing_timestamp = int(view.end_time.timestamp())
 
@@ -741,7 +797,7 @@ async def run_poll(
         allowed_mentions=discord.AllowedMentions(everyone=True)
     )
 
-    active_message = message
+    active_messages[guild.id] = message
 
     logger.info("%s started in %s.", round_name, guild.name)
 
@@ -780,11 +836,10 @@ async def run_poll(
 # ============================================================
 
 async def run_election(guild, duration_seconds):
-
-    global active_view, active_message
+    cfg = get_config(guild)
 
     poll_channel, results_channel, candidate_role, winner_role = (
-        get_configured_items(guild)
+        get_configured_items(guild, cfg)
     )
 
     if not all([
@@ -793,7 +848,10 @@ async def run_election(guild, duration_seconds):
         candidate_role,
         winner_role
     ]):
-        logger.error("Election configuration is incomplete.")
+        logger.error(
+            "Election configuration is incomplete for %s.",
+            guild.name
+        )
         return
 
     try:
@@ -863,7 +921,7 @@ async def run_election(guild, duration_seconds):
             guild,
             poll_channel,
             tied_candidates,
-            config["tie_duration_seconds"],
+            cfg["tie_duration_seconds"],
             "⚖️ Tie-Break Election"
         )
 
@@ -915,21 +973,27 @@ async def run_election(guild, duration_seconds):
         )
 
     except asyncio.CancelledError:
-        logger.info("Election stopped by an administrator.")
+        logger.info(
+            "Election stopped in %s.",
+            guild.name
+        )
 
-        if active_view:
-            active_view.closed = True
+        view = active_views.get(guild.id)
+        message = active_messages.get(guild.id)
 
-            for item in active_view.children:
+        if view:
+            view.closed = True
+
+            for item in view.children:
                 item.disabled = True
 
-            active_view.stop()
+            view.stop()
 
-        if active_message and active_view:
+        if message and view:
             try:
-                await active_message.edit(
-                    embed=active_view.make_embed(),
-                    view=active_view
+                await message.edit(
+                    embed=view.make_embed(),
+                    view=view
                 )
             except discord.HTTPException:
                 pass
@@ -944,7 +1008,10 @@ async def run_election(guild, duration_seconds):
         raise
 
     except Exception:
-        logger.exception("Unexpected election error.")
+        logger.exception(
+            "Unexpected election error in %s.",
+            guild.name
+        )
 
         try:
             await poll_channel.send(
@@ -954,8 +1021,8 @@ async def run_election(guild, duration_seconds):
             pass
 
     finally:
-        active_view = None
-        active_message = None
+        active_views.pop(guild.id, None)
+        active_messages.pop(guild.id, None)
 
 
 # ============================================================
@@ -963,54 +1030,79 @@ async def run_election(guild, duration_seconds):
 # ============================================================
 
 def launch_election(guild, duration_seconds):
+    current_task = active_election_tasks.get(guild.id)
 
-    global active_election_task
-
-    if active_election_task and not active_election_task.done():
+    if current_task and not current_task.done():
         return False
 
-    active_election_task = asyncio.create_task(
+    task = asyncio.create_task(
         run_election(guild, duration_seconds)
     )
 
+    active_election_tasks[guild.id] = task
+
+    def cleanup(completed_task):
+        if active_election_tasks.get(guild.id) is completed_task:
+            active_election_tasks.pop(guild.id, None)
+
+    task.add_done_callback(cleanup)
+
     return True
+
+
+def stop_election(guild):
+    task = active_election_tasks.get(guild.id)
+
+    if task and not task.done():
+        task.cancel()
+        return True
+
+    return False
 
 
 # ============================================================
 # SCHEDULE SETTINGS
 # ============================================================
 
-class ScheduleModal(discord.ui.Modal, title="Election Settings"):
+class ScheduleModal(discord.ui.Modal):
 
-    interval = discord.ui.TextInput(
-        label="Repeat interval (e.g. 14d, 2h, 5m, 30s)",
-        placeholder="14d",
-        default=format_time(config["interval_seconds"]),
-        max_length=20
-    )
+    def __init__(self, cfg):
+        super().__init__(title="Election Settings")
 
-    duration = discord.ui.TextInput(
-        label="Normal voting duration (e.g. 24h, 5m, 30s)",
-        placeholder="24h",
-        default=format_time(config["duration_seconds"]),
-        max_length=20
-    )
+        self.interval = discord.ui.TextInput(
+            label="Repeat interval (e.g. 14d, 2h, 5m, 30s)",
+            placeholder="14d",
+            default=format_time(cfg["interval_seconds"]),
+            max_length=20
+        )
 
-    tie_duration = discord.ui.TextInput(
-        label="Tie-break duration (e.g. 1h, 2m, 30s)",
-        placeholder="1h",
-        default=format_time(config["tie_duration_seconds"]),
-        max_length=20
-    )
+        self.duration = discord.ui.TextInput(
+            label="Normal voting duration (e.g. 24h, 5m, 30s)",
+            placeholder="24h",
+            default=format_time(cfg["duration_seconds"]),
+            max_length=20
+        )
+
+        self.tie_duration = discord.ui.TextInput(
+            label="Tie-break duration (e.g. 1h, 2m, 30s)",
+            placeholder="1h",
+            default=format_time(cfg["tie_duration_seconds"]),
+            max_length=20
+        )
+
+        self.add_item(self.interval)
+        self.add_item(self.duration)
+        self.add_item(self.tie_duration)
 
     async def on_submit(self, interaction):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can change settings.",
                 ephemeral=True
             )
             return
+
+        cfg = get_config(interaction.guild)
 
         try:
             interval_seconds = parse_time(
@@ -1031,29 +1123,28 @@ class ScheduleModal(discord.ui.Modal, title="Election Settings"):
                 8760 * 3600
             )
 
-            config["interval_seconds"] = interval_seconds
-            config["duration_seconds"] = duration_seconds
-            config["tie_duration_seconds"] = tie_duration_seconds
+            cfg["interval_seconds"] = interval_seconds
+            cfg["duration_seconds"] = duration_seconds
+            cfg["tie_duration_seconds"] = tie_duration_seconds
 
-            # Keep older configuration values compatible.
-            config["interval_days"] = (
+            cfg["interval_days"] = (
                 interval_seconds + 86399
             ) // 86400
 
-            config["duration_hours"] = (
+            cfg["duration_hours"] = (
                 duration_seconds + 3599
             ) // 3600
 
-            config["tie_duration_hours"] = (
+            cfg["tie_duration_hours"] = (
                 tie_duration_seconds + 3599
             ) // 3600
 
             next_run = (
-                datetime.datetime.now(get_timezone())
+                datetime.datetime.now(get_timezone(cfg))
                 + datetime.timedelta(seconds=interval_seconds)
             )
 
-            config["next_run"] = next_run.isoformat()
+            cfg["next_run"] = next_run.isoformat()
             save_config()
 
             await interaction.response.send_message(
@@ -1087,7 +1178,6 @@ class PollChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can change settings.",
@@ -1095,7 +1185,8 @@ class PollChannelSelect(discord.ui.ChannelSelect):
             )
             return
 
-        config["poll_channel_id"] = self.values[0].id
+        cfg = get_config(interaction.guild)
+        cfg["poll_channel_id"] = self.values[0].id
         save_config()
 
         await interaction.response.send_message(
@@ -1115,7 +1206,6 @@ class ResultsChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can change settings.",
@@ -1123,7 +1213,8 @@ class ResultsChannelSelect(discord.ui.ChannelSelect):
             )
             return
 
-        config["results_channel_id"] = self.values[0].id
+        cfg = get_config(interaction.guild)
+        cfg["results_channel_id"] = self.values[0].id
         save_config()
 
         await interaction.response.send_message(
@@ -1146,7 +1237,6 @@ class CandidateRoleSelect(discord.ui.RoleSelect):
         )
 
     async def callback(self, interaction):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can change settings.",
@@ -1163,7 +1253,8 @@ class CandidateRoleSelect(discord.ui.RoleSelect):
             )
             return
 
-        config["candidate_role_id"] = role.id
+        cfg = get_config(interaction.guild)
+        cfg["candidate_role_id"] = role.id
         save_config()
 
         await interaction.response.send_message(
@@ -1182,7 +1273,6 @@ class WinnerRoleSelect(discord.ui.RoleSelect):
         )
 
     async def callback(self, interaction):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can change settings.",
@@ -1199,7 +1289,8 @@ class WinnerRoleSelect(discord.ui.RoleSelect):
             )
             return
 
-        config["winner_role_id"] = role.id
+        cfg = get_config(interaction.guild)
+        cfg["winner_role_id"] = role.id
         save_config()
 
         await interaction.response.send_message(
@@ -1229,7 +1320,6 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def schedule_button(self, interaction, button):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -1237,7 +1327,10 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        await interaction.response.send_modal(ScheduleModal())
+        cfg = get_config(interaction.guild)
+        await interaction.response.send_modal(
+            ScheduleModal(cfg)
+        )
 
     @discord.ui.button(
         label="Auto-start",
@@ -1246,7 +1339,6 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def auto_button(self, interaction, button):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -1254,10 +1346,11 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        config["auto_start"] = not config["auto_start"]
+        cfg = get_config(interaction.guild)
+        cfg["auto_start"] = not cfg["auto_start"]
         save_config()
 
-        status = "ON" if config["auto_start"] else "OFF"
+        status = "ON" if cfg["auto_start"] else "OFF"
 
         await interaction.response.send_message(
             f"🔁 Automatic elections are now **{status}**.",
@@ -1271,7 +1364,6 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def start_button(self, interaction, button):
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -1279,16 +1371,19 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        duration = config["duration_seconds"]
+        cfg = get_config(interaction.guild)
 
-        if launch_election(interaction.guild, duration):
+        if launch_election(
+            interaction.guild,
+            cfg["duration_seconds"]
+        ):
             await interaction.response.send_message(
                 "▶️ Election started.",
                 ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                "An election is already running.",
+                "An election is already running in this server.",
                 ephemeral=True
             )
 
@@ -1299,9 +1394,6 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def stop_button(self, interaction, button):
-
-        global active_election_task
-
         if not is_server_owner_from_interaction(interaction):
             await interaction.response.send_message(
                 "Only the server owner can use this dashboard.",
@@ -1309,16 +1401,14 @@ class ElectionDashboard(discord.ui.View):
             )
             return
 
-        if active_election_task and not active_election_task.done():
-            active_election_task.cancel()
-
+        if stop_election(interaction.guild):
             await interaction.response.send_message(
                 "🛑 Election stop requested.",
                 ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                "No election is running.",
+                "No election is running in this server.",
                 ephemeral=True
             )
 
@@ -1329,34 +1419,39 @@ class ElectionDashboard(discord.ui.View):
 
 @bot.command(name="help")
 async def help_command(ctx):
-
     if not is_server_owner(ctx):
         await ctx.send(
             "Only the server owner can open the election dashboard."
         )
         return
 
-    next_run = get_next_run()
+    cfg = get_config(ctx.guild)
+    next_run = get_next_run(cfg)
 
-    poll, results, candidate, winner = get_configured_items(ctx.guild)
-
-    auto_status = (
-        "🟢 ON" if config["auto_start"] else "🔴 OFF"
+    poll, results, candidate, winner = get_configured_items(
+        ctx.guild,
+        cfg
     )
 
-    if active_election_task and not active_election_task.done():
+    auto_status = (
+        "🟢 ON" if cfg["auto_start"] else "🔴 OFF"
+    )
+
+    task = active_election_tasks.get(ctx.guild.id)
+
+    if task and not task.done():
         election_status = "🟢 Election running"
     else:
         election_status = "⚪ No election running"
 
     embed = discord.Embed(
-        title="Election Dashboard",
+        title=f"Election Dashboard — {ctx.guild.name}",
         description=(
             f"{election_status}\n\n"
             f"**Automatic elections:** {auto_status}\n"
-            f"**Repeats:** Every {format_time(config['interval_seconds'])}\n"
-            f"**Voting duration:** {format_time(config['duration_seconds'])}\n"
-            f"**Tie-break duration:** {format_time(config['tie_duration_seconds'])}\n"
+            f"**Repeats:** Every {format_time(cfg['interval_seconds'])}\n"
+            f"**Voting duration:** {format_time(cfg['duration_seconds'])}\n"
+            f"**Tie-break duration:** {format_time(cfg['tie_duration_seconds'])}\n"
             f"**Next election:** "
             f"{next_run.strftime('%b %d, %Y at %I:%M %p')}\n\n"
             f"**Poll channel:** "
@@ -1383,53 +1478,53 @@ async def help_command(ctx):
 
 @bot.command()
 async def testpoll(ctx):
-
     if not is_server_owner(ctx):
         return
 
     if launch_election(ctx.guild, 30):
         await ctx.send("🧪 Started a 30-second test election.")
     else:
-        await ctx.send("An election is already running.")
+        await ctx.send("An election is already running in this server.")
 
 
 @bot.command()
 async def startelection(ctx):
-
     if not is_server_owner(ctx):
         return
 
+    cfg = get_config(ctx.guild)
+
     if launch_election(
         ctx.guild,
-        config["duration_seconds"]
+        cfg["duration_seconds"]
     ):
         await ctx.send("▶️ Election started.")
     else:
-        await ctx.send("An election is already running.")
+        await ctx.send("An election is already running in this server.")
 
 
 @bot.command()
 async def stopelection(ctx):
-
-    global active_election_task
-
     if not is_server_owner(ctx):
         return
 
-    if active_election_task and not active_election_task.done():
-        active_election_task.cancel()
+    if stop_election(ctx.guild):
         await ctx.send("🛑 Election stop requested.")
     else:
-        await ctx.send("No election is running.")
+        await ctx.send("No election is running in this server.")
 
 
 @bot.command()
 async def debug(ctx):
-
     if not is_server_owner(ctx):
         return
 
-    poll, results, candidate, winner = get_configured_items(ctx.guild)
+    cfg = get_config(ctx.guild)
+
+    poll, results, candidate, winner = get_configured_items(
+        ctx.guild,
+        cfg
+    )
 
     bot_member = ctx.guild.get_member(bot.user.id)
 
@@ -1444,11 +1539,17 @@ async def debug(ctx):
         and bot_member.guild_permissions.manage_roles
     )
 
-    next_run = get_next_run()
+    next_run = get_next_run(cfg)
 
     embed = discord.Embed(
         title="Election Bot Debug",
         color=discord.Color.blue()
+    )
+
+    embed.add_field(
+        name="Server",
+        value=ctx.guild.name,
+        inline=False
     )
 
     embed.add_field(
@@ -1487,25 +1588,25 @@ async def debug(ctx):
 
     embed.add_field(
         name="Automatic elections",
-        value="ON" if config["auto_start"] else "OFF",
+        value="ON" if cfg["auto_start"] else "OFF",
         inline=True
     )
 
     embed.add_field(
         name="Repeat interval",
-        value=format_time(config["interval_seconds"]),
+        value=format_time(cfg["interval_seconds"]),
         inline=True
     )
 
     embed.add_field(
         name="Normal voting duration",
-        value=format_time(config["duration_seconds"]),
+        value=format_time(cfg["duration_seconds"]),
         inline=True
     )
 
     embed.add_field(
         name="Tie-break duration",
-        value=format_time(config["tie_duration_seconds"]),
+        value=format_time(cfg["tie_duration_seconds"]),
         inline=True
     )
 
@@ -1522,35 +1623,33 @@ async def debug(ctx):
 # AUTOMATIC SCHEDULER
 # ============================================================
 
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=5)
 async def scheduled_election():
-
     try:
-        if not config["auto_start"]:
-            return
+        for guild in bot.guilds:
+            cfg = get_config(guild)
 
-        next_run = get_next_run()
-        now = datetime.datetime.now(next_run.tzinfo)
+            if not cfg["auto_start"]:
+                continue
 
-        if now >= next_run:
+            next_run = get_next_run(cfg)
+            now = datetime.datetime.now(next_run.tzinfo)
 
-            guild = bot.get_guild(GUILD_ID)
+            if now >= next_run:
+                duration = cfg["duration_seconds"]
 
-            if guild is None:
-                logger.error(
-                    "Scheduled election: server not found. Will retry."
-                )
-                return
-
-            duration = config["duration_seconds"]
-
-            if launch_election(guild, duration):
-                schedule_next_run()
-            else:
-                logger.warning(
-                    "An election was already running. "
-                    "The scheduled election will be retried."
-                )
+                if launch_election(guild, duration):
+                    schedule_next_run(cfg)
+                    logger.info(
+                        "Scheduled election launched in %s.",
+                        guild.name
+                    )
+                else:
+                    logger.warning(
+                        "An election was already running in %s. "
+                        "The scheduled election will be retried.",
+                        guild.name
+                    )
 
     except Exception:
         logger.exception("Scheduler error.")
@@ -1562,17 +1661,48 @@ async def before_scheduled_election():
 
 
 # ============================================================
+# SERVER JOIN / LEAVE
+# ============================================================
+
+@bot.event
+async def on_guild_join(guild):
+    get_config(guild)
+
+    logger.info(
+        "Joined server %s (%s).",
+        guild.name,
+        guild.id
+    )
+
+
+@bot.event
+async def on_guild_remove(guild):
+    logger.info(
+        "Removed from server %s (%s). Configuration retained.",
+        guild.name,
+        guild.id
+    )
+
+
+# ============================================================
 # BOT READY
 # ============================================================
 
 @bot.event
 async def on_ready():
-
     logger.info(
         "Logged in as %s (ID: %s)",
         bot.user,
         bot.user.id
     )
+
+    logger.info(
+        "Connected to %s server(s).",
+        len(bot.guilds)
+    )
+
+    for guild in bot.guilds:
+        get_config(guild)
 
     if not scheduled_election.is_running():
         scheduled_election.start()
