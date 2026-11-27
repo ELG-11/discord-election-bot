@@ -2,6 +2,8 @@
 import os
 import re
 import json
+import shutil
+import tempfile
 import asyncio
 import logging
 import datetime
@@ -25,7 +27,20 @@ logging.basicConfig(
 logger = logging.getLogger("election_bot")
 
 TOKEN = os.environ["TOKEN"]
-CONFIG_FILE = Path("election_config.json")
+
+# Set CONFIG_FILE to a persistent storage path on your host if needed.
+# Otherwise, the bot uses election_config.json in its working directory.
+CONFIG_FILE = Path(
+    os.environ.get("CONFIG_FILE", "election_config.json")
+)
+BACKUP_CONFIG_FILE = CONFIG_FILE.with_name(
+    CONFIG_FILE.name + ".bak"
+)
+
+# This Discord user can configure the bot in any server.
+AUTHORIZED_CONFIGURATOR_IDS = {
+    762476848881205270
+}
 
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_INTERVAL_DAYS = 14
@@ -57,48 +72,180 @@ DEFAULT_CONFIG = {
 all_configs = {"guilds": {}}
 
 
+def read_config_file(path):
+    """Read and validate a configuration JSON file."""
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    if not isinstance(saved, dict):
+        raise ValueError("Configuration root must be a JSON object.")
+
+    if isinstance(saved.get("guilds"), dict):
+        return {"guilds": saved["guilds"]}
+
+    # Support migration from the old single-server format.
+    old_guild_id = saved.get("guild_id")
+
+    if old_guild_id:
+        guild_id = str(old_guild_id)
+        migrated = DEFAULT_CONFIG.copy()
+        migrated.update(saved)
+
+        return {
+            "guilds": {
+                guild_id: migrated
+            }
+        }
+
+    # An empty object is a valid fresh configuration.
+    if not saved:
+        return {"guilds": {}}
+
+    raise ValueError(
+        "Configuration has neither a guilds section nor a guild_id."
+    )
+
+
 def load_all_configs():
+    """
+    Load the main configuration.
+    If it is missing or damaged, try the backup.
+    """
+
     global all_configs
 
-    if not CONFIG_FILE.exists():
-        return
+    for path in (CONFIG_FILE, BACKUP_CONFIG_FILE):
+        if not path.exists():
+            continue
 
-    try:
-        saved = json.loads(CONFIG_FILE.read_text())
+        try:
+            loaded = read_config_file(path)
+            all_configs = loaded
 
-        if isinstance(saved.get("guilds"), dict):
-            all_configs = saved
+            if path == BACKUP_CONFIG_FILE:
+                logger.warning(
+                    "Main configuration could not be used. "
+                    "Recovered configuration from backup."
+                )
+
+                # Recreate the main file from the recovered data.
+                save_all_configs()
+
+            else:
+                logger.info("Configuration loaded from %s.", path)
+
             return
 
-        old_guild_id = saved.get("guild_id")
-
-        if old_guild_id:
-            guild_id = str(old_guild_id)
-            migrated = DEFAULT_CONFIG.copy()
-            migrated.update(saved)
-
-            all_configs = {
-                "guilds": {
-                    guild_id: migrated
-                }
-            }
-
-            logger.info(
-                "Migrated previous configuration for server %s.",
-                guild_id
-            )
-        else:
-            logger.warning(
-                "Old configuration had no server ID. "
-                "Starting with fresh server configurations."
+        except Exception:
+            logger.exception(
+                "Could not load configuration from %s.",
+                path
             )
 
-    except Exception:
-        logger.exception("Could not load configuration.")
+    all_configs = {"guilds": {}}
+
+    logger.warning(
+        "No valid configuration file or backup was found. "
+        "Starting with fresh configurations."
+    )
 
 
 def save_all_configs():
-    CONFIG_FILE.write_text(json.dumps(all_configs, indent=4))
+    """
+    Safely save all server configurations.
+
+    Uses a temporary file and atomic replacement so an interrupted
+    write is much less likely to damage the previous configuration.
+    Keeps a backup of the previous valid configuration.
+    """
+
+    temp_path = None
+
+    try:
+        CONFIG_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        serialized = json.dumps(
+            all_configs,
+            indent=4
+        )
+
+        # Write the new configuration to a temporary file in the
+        # same directory so os.replace can perform an atomic swap.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=CONFIG_FILE.parent,
+            prefix=CONFIG_FILE.name + ".",
+            suffix=".tmp",
+            delete=False
+        ) as temp_file:
+
+            temp_path = Path(temp_file.name)
+
+            temp_file.write(serialized)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        # Back up the existing configuration only if it contains
+        # valid JSON. Never replace a good backup with a corrupt file.
+        if CONFIG_FILE.exists():
+            try:
+                existing = json.loads(
+                    CONFIG_FILE.read_text(encoding="utf-8")
+                )
+
+                if isinstance(existing, dict):
+                    shutil.copy2(
+                        CONFIG_FILE,
+                        BACKUP_CONFIG_FILE
+                    )
+
+            except Exception:
+                logger.warning(
+                    "Existing configuration is not valid JSON. "
+                    "Keeping the previous backup unchanged."
+                )
+
+        # Replace the old configuration with the completed new file.
+        os.replace(
+            temp_path,
+            CONFIG_FILE
+        )
+        temp_path = None
+
+        # Try to flush the directory entry as well.
+        # Some systems do not support directory fsync.
+        try:
+            directory_fd = os.open(
+                str(CONFIG_FILE.parent),
+                os.O_RDONLY
+            )
+
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        except OSError:
+            pass
+
+        logger.info("Configuration saved successfully.")
+
+    except Exception:
+        logger.exception("Could not save configuration.")
+        raise
+
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove temporary configuration file."
+                )
 
 
 def get_config(guild):
@@ -109,7 +256,9 @@ def get_config(guild):
 
         new_config["next_run"] = (
             datetime.datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-            + datetime.timedelta(seconds=new_config["interval_seconds"])
+            + datetime.timedelta(
+                seconds=new_config["interval_seconds"]
+            )
         ).isoformat()
 
         all_configs["guilds"][guild_id] = new_config
@@ -123,9 +272,15 @@ def get_config(guild):
 
     cfg = all_configs["guilds"][guild_id]
 
+    changed = False
+
     for key, value in DEFAULT_CONFIG.items():
         if key not in cfg:
             cfg[key] = value
+            changed = True
+
+    if changed:
+        save_all_configs()
 
     return cfg
 
@@ -283,10 +438,34 @@ def is_server_owner(ctx):
     )
 
 
+def is_config_admin(ctx):
+    """Server owner or explicitly authorized configurator."""
+
+    return (
+        ctx.guild is not None
+        and (
+            ctx.author.id == ctx.guild.owner_id
+            or ctx.author.id in AUTHORIZED_CONFIGURATOR_IDS
+        )
+    )
+
+
 def is_server_owner_from_interaction(interaction):
     return (
         interaction.guild is not None
         and interaction.user.id == interaction.guild.owner_id
+    )
+
+
+def is_config_admin_from_interaction(interaction):
+    """Server owner or explicitly authorized configurator."""
+
+    return (
+        interaction.guild is not None
+        and (
+            interaction.user.id == interaction.guild.owner_id
+            or interaction.user.id in AUTHORIZED_CONFIGURATOR_IDS
+        )
     )
 
 
@@ -711,7 +890,6 @@ async def announce_results(
             )
             return
 
-    # Check role permissions BEFORE changing anyone's roles.
     bot_member = await get_bot_member(guild)
     role_errors = check_winner_role_setup(bot_member, winner_role)
 
@@ -729,14 +907,11 @@ async def announce_results(
         )
         return
 
-    # Refresh the member cache before looking for previous winners.
     try:
         await guild.chunk(cache=True)
     except discord.HTTPException:
         logger.warning("Could not refresh the member list in %s.", guild.name)
 
-    # Remove the Winner role from previous holders first.
-    # If removal fails, do NOT add it to the new winner.
     for member in list(winner_role.members):
         if member.id == winner.id:
             continue
@@ -758,7 +933,6 @@ async def announce_results(
             )
             break
 
-    # Only assign the new winner if previous removals succeeded.
     if not role_errors and winner_role not in winner.roles:
         try:
             await winner.add_roles(
@@ -1143,9 +1317,9 @@ class ScheduleModal(discord.ui.Modal):
         self.add_item(self.tie_duration)
 
     async def on_submit(self, interaction):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can change settings.",
+                "Only the server owner or authorized configurator can change settings.",
                 ephemeral=True
             )
             return
@@ -1212,9 +1386,9 @@ class PollChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can change settings.",
+                "Only the server owner or authorized configurator can change settings.",
                 ephemeral=True
             )
             return
@@ -1240,9 +1414,9 @@ class ResultsChannelSelect(discord.ui.ChannelSelect):
         )
 
     async def callback(self, interaction):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can change settings.",
+                "Only the server owner or authorized configurator can change settings.",
                 ephemeral=True
             )
             return
@@ -1271,9 +1445,9 @@ class CandidateRoleSelect(discord.ui.RoleSelect):
         )
 
     async def callback(self, interaction):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can change settings.",
+                "Only the server owner or authorized configurator can change settings.",
                 ephemeral=True
             )
             return
@@ -1307,9 +1481,9 @@ class WinnerRoleSelect(discord.ui.RoleSelect):
         )
 
     async def callback(self, interaction):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can change settings.",
+                "Only the server owner or authorized configurator can change settings.",
                 ephemeral=True
             )
             return
@@ -1354,9 +1528,9 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def schedule_button(self, interaction, button):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can use this dashboard.",
+                "Only the server owner or authorized configurator can use this dashboard.",
                 ephemeral=True
             )
             return
@@ -1371,9 +1545,9 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def auto_button(self, interaction, button):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can use this dashboard.",
+                "Only the server owner or authorized configurator can use this dashboard.",
                 ephemeral=True
             )
             return
@@ -1396,9 +1570,9 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def start_button(self, interaction, button):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can use this dashboard.",
+                "Only the server owner or authorized configurator can use this dashboard.",
                 ephemeral=True
             )
             return
@@ -1423,9 +1597,9 @@ class ElectionDashboard(discord.ui.View):
         row=4
     )
     async def stop_button(self, interaction, button):
-        if not is_server_owner_from_interaction(interaction):
+        if not is_config_admin_from_interaction(interaction):
             await interaction.response.send_message(
-                "Only the server owner can use this dashboard.",
+                "Only the server owner or authorized configurator can use this dashboard.",
                 ephemeral=True
             )
             return
@@ -1448,9 +1622,9 @@ class ElectionDashboard(discord.ui.View):
 
 @bot.command(name="help")
 async def help_command(ctx):
-    if not is_server_owner(ctx):
+    if not is_config_admin(ctx):
         await ctx.send(
-            "Only the server owner can open the election dashboard."
+            "Only the server owner or authorized configurator can open the election dashboard."
         )
         return
 
@@ -1498,7 +1672,7 @@ async def help_command(ctx):
 
 @bot.command()
 async def testpoll(ctx):
-    if not is_server_owner(ctx):
+    if not is_config_admin(ctx):
         return
 
     if launch_election(ctx.guild, 30):
@@ -1509,7 +1683,7 @@ async def testpoll(ctx):
 
 @bot.command()
 async def startelection(ctx):
-    if not is_server_owner(ctx):
+    if not is_config_admin(ctx):
         return
 
     cfg = get_config(ctx.guild)
@@ -1522,7 +1696,7 @@ async def startelection(ctx):
 
 @bot.command()
 async def stopelection(ctx):
-    if not is_server_owner(ctx):
+    if not is_config_admin(ctx):
         return
 
     if stop_election(ctx.guild):
@@ -1533,7 +1707,7 @@ async def stopelection(ctx):
 
 @bot.command()
 async def debug(ctx):
-    if not is_server_owner(ctx):
+    if not is_config_admin(ctx):
         return
 
     cfg = get_config(ctx.guild)
@@ -1543,7 +1717,6 @@ async def debug(ctx):
         cfg
     )
 
-    # Fetch the bot member instead of relying only on the local cache.
     bot_member = await get_bot_member(ctx.guild)
 
     manage_roles = (
