@@ -66,17 +66,14 @@ def load_all_configs():
     try:
         saved = json.loads(CONFIG_FILE.read_text())
 
-        # New multi-server format.
         if isinstance(saved.get("guilds"), dict):
             all_configs = saved
             return
 
-        # Migrate the old single-server configuration.
         old_guild_id = saved.get("guild_id")
 
         if old_guild_id:
             guild_id = str(old_guild_id)
-
             migrated = DEFAULT_CONFIG.copy()
             migrated.update(saved)
 
@@ -101,9 +98,7 @@ def load_all_configs():
 
 
 def save_all_configs():
-    CONFIG_FILE.write_text(
-        json.dumps(all_configs, indent=4)
-    )
+    CONFIG_FILE.write_text(json.dumps(all_configs, indent=4))
 
 
 def get_config(guild):
@@ -113,12 +108,8 @@ def get_config(guild):
         new_config = DEFAULT_CONFIG.copy()
 
         new_config["next_run"] = (
-            datetime.datetime.now(
-                ZoneInfo(DEFAULT_TIMEZONE)
-            )
-            + datetime.timedelta(
-                seconds=new_config["interval_seconds"]
-            )
+            datetime.datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+            + datetime.timedelta(seconds=new_config["interval_seconds"])
         ).isoformat()
 
         all_configs["guilds"][guild_id] = new_config
@@ -132,7 +123,6 @@ def get_config(guild):
 
     cfg = all_configs["guilds"][guild_id]
 
-    # Ensure older configurations have all required settings.
     for key, value in DEFAULT_CONFIG.items():
         if key not in cfg:
             cfg[key] = value
@@ -153,7 +143,6 @@ load_all_configs()
 
 def parse_time(value, default_unit, maximum_seconds):
     value = value.strip().lower().replace(" ", "")
-
     match = re.fullmatch(r"(\d+)(s|m|h|d)?", value)
 
     if not match:
@@ -194,13 +183,10 @@ def format_time(seconds):
 
     if days:
         parts.append(f"{days}d")
-
     if hours:
         parts.append(f"{hours}h")
-
     if minutes:
         parts.append(f"{minutes}m")
-
     if remaining_seconds:
         parts.append(f"{remaining_seconds}s")
 
@@ -225,9 +211,7 @@ def get_next_run(cfg):
 
     next_run = (
         datetime.datetime.now(get_timezone(cfg))
-        + datetime.timedelta(
-            seconds=cfg["interval_seconds"]
-        )
+        + datetime.timedelta(seconds=cfg["interval_seconds"])
     )
 
     cfg["next_run"] = next_run.isoformat()
@@ -239,9 +223,7 @@ def get_next_run(cfg):
 def schedule_next_run(cfg):
     next_run = (
         datetime.datetime.now(get_timezone(cfg))
-        + datetime.timedelta(
-            seconds=cfg["interval_seconds"]
-        )
+        + datetime.timedelta(seconds=cfg["interval_seconds"])
     )
 
     cfg["next_run"] = next_run.isoformat()
@@ -266,10 +248,7 @@ def keep_alive():
     port = int(os.environ.get("PORT", 8080))
 
     Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=port
-        ),
+        target=lambda: app.run(host="0.0.0.0", port=port),
         daemon=True
     ).start()
 
@@ -288,10 +267,7 @@ bot = commands.Bot(
     help_command=None
 )
 
-# Each server gets its own election task.
 active_election_tasks = {}
-
-# Each server gets its own active poll information.
 active_views = {}
 active_messages = {}
 
@@ -323,18 +299,77 @@ def get_configured_items(guild, cfg):
     )
 
 
+async def get_bot_member(guild):
+    """
+    Get the bot's actual member object.
+    Try the guild cache first, then fetch it from Discord.
+    """
+
+    member = guild.me
+
+    if member is None and bot.user is not None:
+        member = guild.get_member(bot.user.id)
+
+    if member is None and bot.user is not None:
+        try:
+            member = await guild.fetch_member(bot.user.id)
+        except discord.HTTPException:
+            logger.exception(
+                "Could not fetch the bot's member information in %s.",
+                guild.name
+            )
+
+    return member
+
+
+def check_winner_role_setup(bot_member, winner_role):
+    """
+    Returns a list of problems preventing the bot from assigning
+    or removing the configured Winner role.
+    """
+
+    problems = []
+
+    if bot_member is None:
+        problems.append("Could not find the bot's member information.")
+        return problems
+
+    if winner_role is None:
+        problems.append("The Winner role has not been configured.")
+        return problems
+
+    if not bot_member.guild_permissions.manage_roles:
+        problems.append("The bot is missing the Manage Roles permission.")
+
+    if winner_role.is_default():
+        problems.append("The @everyone role cannot be used as the Winner role.")
+
+    if winner_role.managed:
+        problems.append(
+            "The Winner role is managed by an integration and cannot be assigned manually."
+        )
+
+    if not bot_member.top_role > winner_role:
+        problems.append(
+            "The bot's highest role must be ABOVE the Winner role."
+        )
+
+    if hasattr(winner_role, "is_assignable"):
+        if not winner_role.is_assignable():
+            problems.append(
+                "Discord reports that the Winner role is not assignable by this bot."
+            )
+
+    return problems
+
+
 # ============================================================
 # ELECTION POLL
 # ============================================================
 
 class ElectionView(discord.ui.View):
 
-    def __init__(
-        self,
-        candidates,
-        duration_seconds,
-        round_name="Election"
-    ):
+    def __init__(self, candidates, duration_seconds, round_name="Election"):
         super().__init__(timeout=None)
 
         self.candidates = {
@@ -431,9 +466,7 @@ class ElectionView(discord.ui.View):
                 else "▫️"
             )
 
-            name = discord.utils.escape_markdown(
-                member.display_name
-            )
+            name = discord.utils.escape_markdown(member.display_name)
 
             percentage = (
                 round(amount / total_votes * 100)
@@ -489,7 +522,6 @@ class ElectionView(discord.ui.View):
     def make_callback(self, candidate_id):
 
         async def callback(interaction):
-
             if self.closed:
                 await interaction.response.send_message(
                     "Voting has closed.",
@@ -536,7 +568,6 @@ class ManualWinnerView(discord.ui.View):
             self.add_item(button)
 
     async def interaction_check(self, interaction):
-
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 "Only the server owner can select the winner.",
@@ -549,7 +580,6 @@ class ManualWinnerView(discord.ui.View):
     def make_callback(self, candidate):
 
         async def callback(interaction):
-
             if self.future.done():
                 await interaction.response.send_message(
                     "A winner has already been selected.",
@@ -575,7 +605,6 @@ class ManualWinnerView(discord.ui.View):
         return callback
 
     async def on_timeout(self):
-
         if not self.future.done():
             self.future.set_result(None)
 
@@ -583,11 +612,7 @@ class ManualWinnerView(discord.ui.View):
             item.disabled = True
 
 
-async def ask_owner_to_choose(
-    guild,
-    results_channel,
-    tied_candidates
-):
+async def ask_owner_to_choose(guild, results_channel, tied_candidates):
     view = ManualWinnerView(guild, tied_candidates)
 
     mentions = ", ".join(
@@ -679,42 +704,75 @@ async def announce_results(
                 "No role changes were made."
             )
             return
+        except discord.HTTPException:
+            await results_channel.send(
+                "Could not retrieve the winning member from Discord. "
+                "No role changes were made."
+            )
+            return
 
-    role_errors = []
+    # Check role permissions BEFORE changing anyone's roles.
+    bot_member = await get_bot_member(guild)
+    role_errors = check_winner_role_setup(bot_member, winner_role)
 
+    if role_errors:
+        await results_channel.send(
+            "⚠️ **Could not change the Winner role.**\n\n"
+            + "\n".join(f"• {error}" for error in role_errors)
+            + "\n\nPlease fix the bot permissions or role position "
+              "and run another election."
+        )
+        logger.error(
+            "Winner role setup problem in %s: %s",
+            guild.name,
+            "; ".join(role_errors)
+        )
+        return
+
+    # Refresh the member cache before looking for previous winners.
     try:
         await guild.chunk(cache=True)
     except discord.HTTPException:
-        logger.warning("Could not refresh the member list.")
+        logger.warning("Could not refresh the member list in %s.", guild.name)
 
-    for member in guild.members:
-        if winner_role in member.roles and member.id != winner.id:
-            try:
-                await member.remove_roles(
-                    winner_role,
-                    reason="Election winner changed"
-                )
-            except discord.Forbidden:
-                role_errors.append(
-                    f"Could not remove the role from {member.display_name}."
-                )
-                break
-            except discord.HTTPException:
-                role_errors.append(
-                    "Discord error removing an old winner role."
-                )
-                break
+    # Remove the Winner role from previous holders first.
+    # If removal fails, do NOT add it to the new winner.
+    for member in list(winner_role.members):
+        if member.id == winner.id:
+            continue
 
-    try:
-        if winner_role not in winner.roles:
+        try:
+            await member.remove_roles(
+                winner_role,
+                reason="Election winner changed"
+            )
+        except discord.Forbidden:
+            role_errors.append(
+                f"Discord refused to remove the role from {member.display_name}."
+            )
+            break
+        except discord.HTTPException as error:
+            role_errors.append(
+                f"Discord error removing the role from {member.display_name}: "
+                f"{error}"
+            )
+            break
+
+    # Only assign the new winner if previous removals succeeded.
+    if not role_errors and winner_role not in winner.roles:
+        try:
             await winner.add_roles(
                 winner_role,
                 reason="Won the server election"
             )
-    except discord.Forbidden:
-        role_errors.append("Could not assign the Winner role.")
-    except discord.HTTPException:
-        role_errors.append("Discord error assigning the Winner role.")
+        except discord.Forbidden:
+            role_errors.append(
+                "Discord refused to assign the Winner role to the new winner."
+            )
+        except discord.HTTPException as error:
+            role_errors.append(
+                f"Discord error assigning the Winner role: {error}"
+            )
 
     description = (
         f"Congratulations to {winner.mention}!\n"
@@ -749,11 +807,7 @@ async def announce_results(
     if role_errors:
         embed.add_field(
             name="⚠️ Role assignment warning",
-            value=(
-                "\n".join(role_errors)
-                + "\n\nCheck that the bot has Manage Roles "
-                "and its role is above the Winner role."
-            ),
+            value="\n".join(role_errors)[:1024],
             inline=False
         )
     else:
@@ -880,7 +934,6 @@ async def run_election(guild, duration_seconds):
             )
             return
 
-        # ROUND 1: Normal election.
         first_view = await run_poll(
             guild,
             poll_channel,
@@ -906,7 +959,6 @@ async def run_election(guild, duration_seconds):
             )
             return
 
-        # ROUND 2: Tie-break election.
         tied_candidates = [
             first_view.candidates[candidate_id]
             for candidate_id in first_leaders
@@ -943,7 +995,6 @@ async def run_election(guild, duration_seconds):
             )
             return
 
-        # ROUND 3: Ask the server owner to choose.
         final_tied_candidates = [
             tie_view.candidates[candidate_id]
             for candidate_id in tie_leaders
@@ -973,10 +1024,7 @@ async def run_election(guild, duration_seconds):
         )
 
     except asyncio.CancelledError:
-        logger.info(
-            "Election stopped in %s.",
-            guild.name
-        )
+        logger.info("Election stopped in %s.", guild.name)
 
         view = active_views.get(guild.id)
         message = active_messages.get(guild.id)
@@ -1106,38 +1154,24 @@ class ScheduleModal(discord.ui.Modal):
 
         try:
             interval_seconds = parse_time(
-                self.interval.value,
-                "d",
-                3650 * 86400
+                self.interval.value, "d", 3650 * 86400
             )
 
             duration_seconds = parse_time(
-                self.duration.value,
-                "h",
-                8760 * 3600
+                self.duration.value, "h", 8760 * 3600
             )
 
             tie_duration_seconds = parse_time(
-                self.tie_duration.value,
-                "h",
-                8760 * 3600
+                self.tie_duration.value, "h", 8760 * 3600
             )
 
             cfg["interval_seconds"] = interval_seconds
             cfg["duration_seconds"] = duration_seconds
             cfg["tie_duration_seconds"] = tie_duration_seconds
 
-            cfg["interval_days"] = (
-                interval_seconds + 86399
-            ) // 86400
-
-            cfg["duration_hours"] = (
-                duration_seconds + 3599
-            ) // 3600
-
-            cfg["tie_duration_hours"] = (
-                tie_duration_seconds + 3599
-            ) // 3600
+            cfg["interval_days"] = (interval_seconds + 86399) // 86400
+            cfg["duration_hours"] = (duration_seconds + 3599) // 3600
+            cfg["tie_duration_hours"] = (tie_duration_seconds + 3599) // 3600
 
             next_run = (
                 datetime.datetime.now(get_timezone(cfg))
@@ -1328,9 +1362,7 @@ class ElectionDashboard(discord.ui.View):
             return
 
         cfg = get_config(interaction.guild)
-        await interaction.response.send_modal(
-            ScheduleModal(cfg)
-        )
+        await interaction.response.send_modal(ScheduleModal(cfg))
 
     @discord.ui.button(
         label="Auto-start",
@@ -1373,10 +1405,7 @@ class ElectionDashboard(discord.ui.View):
 
         cfg = get_config(interaction.guild)
 
-        if launch_election(
-            interaction.guild,
-            cfg["duration_seconds"]
-        ):
+        if launch_election(interaction.guild, cfg["duration_seconds"]):
             await interaction.response.send_message(
                 "▶️ Election started.",
                 ephemeral=True
@@ -1433,9 +1462,7 @@ async def help_command(ctx):
         cfg
     )
 
-    auto_status = (
-        "🟢 ON" if cfg["auto_start"] else "🔴 OFF"
-    )
+    auto_status = "🟢 ON" if cfg["auto_start"] else "🔴 OFF"
 
     task = active_election_tasks.get(ctx.guild.id)
 
@@ -1454,22 +1481,15 @@ async def help_command(ctx):
             f"**Tie-break duration:** {format_time(cfg['tie_duration_seconds'])}\n"
             f"**Next election:** "
             f"{next_run.strftime('%b %d, %Y at %I:%M %p')}\n\n"
-            f"**Poll channel:** "
-            f"{poll.mention if poll else 'Not set'}\n"
-            f"**Results channel:** "
-            f"{results.mention if results else 'Not set'}\n\n"
-            f"**Candidate role:** "
-            f"{candidate.name if candidate else 'Not set'}\n"
-            f"**Winner role:** "
-            f"{winner.name if winner else 'Not set'}"
+            f"**Poll channel:** {poll.mention if poll else 'Not set'}\n"
+            f"**Results channel:** {results.mention if results else 'Not set'}\n\n"
+            f"**Candidate role:** {candidate.name if candidate else 'Not set'}\n"
+            f"**Winner role:** {winner.name if winner else 'Not set'}"
         ),
         color=discord.Color.blurple()
     )
 
-    await ctx.send(
-        embed=embed,
-        view=ElectionDashboard()
-    )
+    await ctx.send(embed=embed, view=ElectionDashboard())
 
 
 # ============================================================
@@ -1494,10 +1514,7 @@ async def startelection(ctx):
 
     cfg = get_config(ctx.guild)
 
-    if launch_election(
-        ctx.guild,
-        cfg["duration_seconds"]
-    ):
+    if launch_election(ctx.guild, cfg["duration_seconds"]):
         await ctx.send("▶️ Election started.")
     else:
         await ctx.send("An election is already running in this server.")
@@ -1526,18 +1543,21 @@ async def debug(ctx):
         cfg
     )
 
-    bot_member = ctx.guild.get_member(bot.user.id)
+    # Fetch the bot member instead of relying only on the local cache.
+    bot_member = await get_bot_member(ctx.guild)
 
-    hierarchy_ok = bool(
-        bot_member
-        and winner
+    manage_roles = (
+        bot_member is not None
+        and bot_member.guild_permissions.manage_roles
+    )
+
+    hierarchy_ok = (
+        bot_member is not None
+        and winner is not None
         and bot_member.top_role > winner
     )
 
-    manage_roles = bool(
-        bot_member
-        and bot_member.guild_permissions.manage_roles
-    )
+    role_problems = check_winner_role_setup(bot_member, winner)
 
     next_run = get_next_run(cfg)
 
@@ -1554,34 +1574,76 @@ async def debug(ctx):
 
     embed.add_field(
         name="Poll channel",
-        value=poll.mention if poll else "Missing",
+        value=poll.mention if poll else "❌ Missing",
         inline=True
     )
 
     embed.add_field(
         name="Results channel",
-        value=results.mention if results else "Missing",
+        value=results.mention if results else "❌ Missing",
         inline=True
     )
 
     embed.add_field(
         name="Candidate role",
-        value=candidate.name if candidate else "Missing",
+        value=candidate.name if candidate else "❌ Missing",
         inline=True
     )
 
     embed.add_field(
         name="Winner role",
-        value=winner.name if winner else "Missing",
+        value=winner.name if winner else "❌ Missing",
         inline=True
     )
 
     embed.add_field(
-        name="Role permissions",
+        name="Bot member lookup",
         value=(
-            "✅ Bot can manage Winner role"
-            if manage_roles and hierarchy_ok
-            else "❌ Check Manage Roles and role hierarchy"
+            f"✅ Found: {bot_member.display_name}"
+            if bot_member else "❌ Could not find bot member"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Manage Roles permission",
+        value=(
+            "✅ Enabled" if manage_roles
+            else "❌ Missing"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Role hierarchy",
+        value=(
+            "✅ Bot role is above Winner role"
+            if hierarchy_ok
+            else "❌ Bot role must be above Winner role"
+        ),
+        inline=True
+    )
+
+    if winner and bot_member:
+        embed.add_field(
+            name="Bot's highest role",
+            value=bot_member.top_role.name,
+            inline=True
+        )
+
+    if winner:
+        embed.add_field(
+            name="Winner role position",
+            value=str(winner.position),
+            inline=True
+        )
+
+    embed.add_field(
+        name="Role assignment diagnosis",
+        value=(
+            "\n".join(f"❌ {problem}" for problem in role_problems)
+            if role_problems
+            else "✅ No role permission or hierarchy problems detected."
         ),
         inline=False
     )
