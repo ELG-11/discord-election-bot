@@ -2,7 +2,6 @@
 import os
 import re
 import json
-import math
 import asyncio
 import logging
 import datetime
@@ -31,7 +30,6 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 CONFIG_FILE = Path("election_config.json")
 
 DEFAULT_TIMEZONE = "America/New_York"
-
 DEFAULT_INTERVAL_DAYS = 14
 DEFAULT_DURATION_HOURS = 24
 DEFAULT_TIE_DURATION_HOURS = 1
@@ -72,7 +70,6 @@ def load_config():
             saved = json.loads(CONFIG_FILE.read_text())
             defaults.update(saved)
 
-            # Migrate older configuration files automatically.
             if "interval_seconds" not in saved:
                 defaults["interval_seconds"] = (
                     defaults["interval_days"] * 86400
@@ -103,28 +100,30 @@ def save_config():
 
 def parse_time(value, default_unit, maximum_seconds):
     """
-    Accepts:
-    5m = 5 minutes
-    2h = 2 hours
+    Supported formats:
+    30s = 30 seconds
+    5m  = 5 minutes
+    2h  = 2 hours
     14d = 14 days
 
-    Plain numbers use the field's default unit.
+    Plain numbers use the default unit.
     """
 
     value = value.strip().lower().replace(" ", "")
 
-    match = re.fullmatch(r"(\d+)(m|h|d)?", value)
+    match = re.fullmatch(r"(\d+)(s|m|h|d)?", value)
 
     if not match:
         raise ValueError(
-            "Use a number followed by m, h, or d. "
-            "Examples: 5m, 2h, 14d."
+            "Use a number followed by s, m, h, or d. "
+            "Examples: 30s, 5m, 2h, 14d."
         )
 
     amount = int(match.group(1))
     unit = match.group(2) or default_unit
 
     multipliers = {
+        "s": 1,
         "m": 60,
         "h": 3600,
         "d": 86400,
@@ -132,8 +131,8 @@ def parse_time(value, default_unit, maximum_seconds):
 
     seconds = amount * multipliers[unit]
 
-    if seconds < 60:
-        raise ValueError("The minimum setting is 1 minute.")
+    if seconds < 1:
+        raise ValueError("The minimum setting is 1 second.")
 
     if seconds > maximum_seconds:
         raise ValueError("That duration is too long.")
@@ -146,7 +145,7 @@ def format_time(seconds):
 
     days, remainder = divmod(seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
-    minutes, _ = divmod(remainder, 60)
+    minutes, remaining_seconds = divmod(remainder, 60)
 
     parts = []
 
@@ -156,10 +155,13 @@ def format_time(seconds):
     if hours:
         parts.append(f"{hours}h")
 
-    if minutes and not days:
+    if minutes:
         parts.append(f"{minutes}m")
 
-    return " ".join(parts) if parts else "1m"
+    if remaining_seconds:
+        parts.append(f"{remaining_seconds}s")
+
+    return " ".join(parts) if parts else "0s"
 
 
 def get_timezone():
@@ -446,7 +448,6 @@ class ElectionView(discord.ui.View):
 
             self.votes[interaction.user.id] = candidate_id
 
-            # Update the same poll message.
             await interaction.response.edit_message(
                 embed=self.make_embed(),
                 view=self
@@ -627,7 +628,6 @@ async def announce_results(
     except discord.HTTPException:
         logger.warning("Could not refresh the member list.")
 
-    # Remove the Winner role from previous holders.
     for member in guild.members:
         if winner_role in member.roles and member.id != winner.id:
             try:
@@ -646,7 +646,6 @@ async def announce_results(
                 )
                 break
 
-    # Give the Winner role to the new winner.
     try:
         if winner_role not in winner.roles:
             await winner.add_roles(
@@ -732,8 +731,6 @@ async def run_poll(
 
     closing_timestamp = int(view.end_time.timestamp())
 
-    # The @everyone announcement is part of the poll message.
-    # This keeps the announcement and poll together.
     message = await poll_channel.send(
         content=(
             "@everyone 🗳️ **Election started!**\n"
@@ -842,7 +839,6 @@ async def run_election(guild, duration_seconds):
 
         first_leaders = first_view.get_leaders()
 
-        # A single winner: finish normally.
         if len(first_leaders) == 1:
             await announce_results(
                 guild,
@@ -880,7 +876,6 @@ async def run_election(guild, duration_seconds):
 
         tie_leaders = tie_view.get_leaders()
 
-        # Tie-break produced a clear winner.
         if len(tie_leaders) == 1:
             await announce_results(
                 guild,
@@ -988,21 +983,21 @@ def launch_election(guild, duration_seconds):
 class ScheduleModal(discord.ui.Modal, title="Election Settings"):
 
     interval = discord.ui.TextInput(
-        label="Repeat interval (e.g. 14d, 2h, 5m)",
+        label="Repeat interval (e.g. 14d, 2h, 5m, 30s)",
         placeholder="14d",
         default=format_time(config["interval_seconds"]),
         max_length=20
     )
 
     duration = discord.ui.TextInput(
-        label="Normal voting duration (e.g. 24h, 5m)",
+        label="Normal voting duration (e.g. 24h, 5m, 30s)",
         placeholder="24h",
         default=format_time(config["duration_seconds"]),
         max_length=20
     )
 
     tie_duration = discord.ui.TextInput(
-        label="Tie-break duration (e.g. 1h, 2m)",
+        label="Tie-break duration (e.g. 1h, 2m, 30s)",
         placeholder="1h",
         default=format_time(config["tie_duration_seconds"]),
         max_length=20
@@ -1041,15 +1036,17 @@ class ScheduleModal(discord.ui.Modal, title="Election Settings"):
             config["tie_duration_seconds"] = tie_duration_seconds
 
             # Keep older configuration values compatible.
-            config["interval_days"] = math.ceil(
-                interval_seconds / 86400
-            )
-            config["duration_hours"] = math.ceil(
-                duration_seconds / 3600
-            )
-            config["tie_duration_hours"] = math.ceil(
-                tie_duration_seconds / 3600
-            )
+            config["interval_days"] = (
+                interval_seconds + 86399
+            ) // 86400
+
+            config["duration_hours"] = (
+                duration_seconds + 3599
+            ) // 3600
+
+            config["tie_duration_hours"] = (
+                tie_duration_seconds + 3599
+            ) // 3600
 
             next_run = (
                 datetime.datetime.now(get_timezone())
